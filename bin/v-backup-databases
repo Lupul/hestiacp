@@ -1,0 +1,243 @@
+#!/bin/bash
+# info: backup user databases
+# options: USER COMPRESS NOTIFY
+# labels: 
+#
+# example: v-backup-databases admin yes no
+#
+# The call is used for backing up user databases only.
+
+
+#----------------------------------------------------------#
+#                    Variable&Function                     #
+#----------------------------------------------------------#
+
+# Importing system variables
+source /etc/profile
+
+# Argument definition
+user=$1
+compress=${2-yes}
+notify=${3-no}
+
+# Includes
+source $HESTIA/func/main.sh
+source $HESTIA/func/domain.sh
+source $HESTIA/func/db.sh
+source $HESTIA/func/backup.sh
+source $HESTIA/conf/hestia.conf
+
+
+#----------------------------------------------------------#
+#                    Verifications                         #
+#----------------------------------------------------------#
+
+check_args '1' "$#" 'USER [COMPRESS] [NOTIFY]'
+is_format_valid 'user'
+is_boolean_format_valid "$compress" 'compress'
+is_boolean_format_valid "$notify" 'notify'
+is_system_enabled "$BACKUP_SYSTEM" 'BACKUP_SYSTEM'
+is_object_valid 'user' 'USER' "$user"
+is_object_unsuspended 'user' 'USER' "$user"
+is_backup_enabled
+
+
+#----------------------------------------------------------#
+#                       Action                             #
+#----------------------------------------------------------#
+
+check_backup_conditions
+
+# Set backup directory if undefined
+if [ -z "$BACKUP" ]; then
+    BACKUP=/backup
+fi
+
+BACKUP="${BACKUP}/databases"
+
+mkdir -p $BACKUP
+
+# Get current time
+start_time=$(date '+%s')
+
+# Set notification email and subject
+subj="$user → backup failed"
+email=$(grep CONTACT $HESTIA/data/users/admin/user.conf |cut -f 2 -d \')
+
+# Validate available disk space (take usage * 2, due to the backup handling)
+let u_disk=$(grep "U_DISK=" $HESTIA/data/users/$user/user.conf |cut -f 2 -d \')*2
+let v_disk=$(($(stat -f --format="%a*%S" $BACKUP)))/1024/1024
+
+if [ "$u_disk" -gt "$v_disk" ]; then
+    echo "not enough diskspace available to perform the backup." |$SENDMAIL -s "$subj" $email $notify
+    check_result $E_LIMIT "not enough diskspace available to perform the backup."
+fi
+
+if [ -z "$BACKUP_TEMP" ]; then
+    BACKUP_TEMP=$BACKUP
+fi
+
+# Creating temporary directory
+tmpdir=$(mktemp -p $BACKUP_TEMP -d)
+
+if [ "$?" -ne 0 ]; then
+    echo "Can't create tmp dir $tmpdir" |$SENDMAIL -s "$subj" $email $notify
+    check_result $E_NOTEXIST "can't create tmp dir"
+fi
+
+# Parsing excludes
+if [ -e "$USER_DATA/backup-excludes.conf" ]; then
+    source "$USER_DATA/backup-excludes.conf"
+fi
+
+# Databases
+if [ ! -z "$DB_SYSTEM" ] && [ "$DB" != '*' ]; then
+    echo -e "\n-- DB --" |tee -a "$BACKUP/$user.log"
+    mkdir "$tmpdir/db/"
+
+    # Parsing database exclusions
+    for database in $(search_objects 'db' 'SUSPENDED' "*" 'DB'); do
+        exclusion=$(echo "$DB" |tr ',' '\n' |grep "^$database$")
+        if [ -z "$exclusion" ]; then
+            db_list="$db_list $database"
+        else
+            echo "$(date "+%F %T") excluding $database" |\
+                tee -a "$BACKUP/$user.log"
+        fi
+    done
+
+    i=0
+    conf="$USER_DATA/db.conf"
+    db_list=$(echo "$db_list" |sed -e "s/  */\ /g" -e "s/^ //")
+    for database in $db_list; do
+        check_backup_conditions
+        ((i ++))
+        get_database_values
+
+        echo -e "$(date "+%F %T") $database ($TYPE)" |tee -a $BACKUP/$user.log
+        mkdir -p "$tmpdir/db/$database/conf"
+        mkdir -p "$tmpdir/db/$database/hestia"
+
+        cd "$tmpdir/db/$database/"
+        grep "DB='$database'" "$conf" > hestia/db.conf
+
+        dump="$tmpdir/db/$database/$database.$TYPE.sql"
+        if [ "$BACKUP_MODE" = 'zstd' ]; then
+                    dumpgz="$tmpdir/db/$database/$database.$TYPE.sql.zst"
+        else
+            dumpgz="$tmpdir/db/$database/$database.$TYPE.sql.gz"        
+        fi
+
+        grants="$tmpdir/db/$database/conf/$database.$TYPE.$DBUSER"
+        if [ ! -f "$dumpgz" ]; then
+
+            WAIT_LOOP_ENTERED=0
+            while true
+            do
+                if pgrep -x "mysqldump" > /dev/null
+                then
+                    WAIT_LOOP_ENTERED=1
+                    echo "Wait other mysqldump to finish"
+                    sleep 1
+                else
+                    if [ "$WAIT_LOOP_ENTERED" -eq 1 ]; then
+                        echo "We can use mysqldump now"
+                    fi
+                    break
+                fi
+            done
+
+            case $TYPE in
+                mysql) dump_mysql_database ;;
+                pgsql) dump_pgsql_database ;;
+            esac
+
+            # Compress dump
+            if [ "$BACKUP_MODE" = 'zstd' ]; then
+                zstd -$BACKUP_GZIP $dump
+            else    
+                gzip -$BACKUP_GZIP $dump
+            fi
+
+            [[ -f $dump ]] && rm $dump;              
+        fi
+    done
+
+    # Print total
+    if [ "$i" -eq 1 ]; then
+        echo -e "$(date "+%F %T") *** $i database ***" |\
+            tee -a "$BACKUP/$user.log"
+    else
+        echo -e "$(date "+%F %T") *** $i databases ***"|\
+            tee -a "$BACKUP/$user.log"
+    fi
+fi
+
+
+
+# Get backup size
+size="$(du -shm $tmpdir |cut -f 1)"
+
+# Get current time
+end_time=$(date '+%s')
+time_n_date=$(date +'%T %F')
+time=$(echo "$time_n_date" |cut -f 1 -d \ )
+date=$(echo "$time_n_date" |cut -f 2 -d \ )
+backup_new_date=$(date +"%Y-%m-%d_%H-%M-%S")
+
+echo -e "\n-- SUMMARY --" |tee -a $BACKUP/$user.log
+
+# Switching on backup system types
+for backup_type in $(echo -e "${BACKUP_SYSTEM//,/\\n}"); do
+    case $backup_type in
+        local) local_backup ;;
+        ftp)   ftp_backup ;;
+        sftp)  sftp_backup ;;
+        google) google_backup ;;
+    esac
+done
+
+# Removing tmpdir
+if [[ $tmpdir && -d $tmpdir ]]; then
+    rm -rf "$tmpdir"
+fi
+
+# Calculation run time
+run_time=$((end_time - start_time))
+run_time=$((run_time / 60))
+current_time=$(date "+%T")
+if [ "$run_time" -lt 1 ]; then
+    run_time=1
+fi
+min=minutes
+if [ "$run_time" -eq 1 ]; then
+    min=minute
+fi
+
+echo "$(date "+%F %T") Size: $size MB" |tee -a $BACKUP/$user.log
+echo "$(date "+%F %T") Runtime: $run_time $min" |tee -a $BACKUP/$user.log
+
+
+#----------------------------------------------------------#
+#                       Hestia                             #
+#----------------------------------------------------------#
+
+
+
+# Deleting task from queue
+sed -i "/v-backup-databases $user /d" $HESTIA/data/queue/backup.pipe
+
+# Send notification
+if [ -e "$BACKUP/$user.log" ] && [ "$notify" = "yes" ]; then
+    cd $BACKUP
+    subj="$user → backup has been completed"
+    email=$(get_user_value '$CONTACT')
+    cat $BACKUP/$user.log |$SENDMAIL -s "$subj" $email $notify
+    rm $BACKUP/$user.log
+    $BIN/v-add-user-notification "$user" "Database backup created successfully" "<b>Archive:</b> $user.$backup_new_date.tar"
+fi
+
+# Logging
+log_event "$OK" "$ARGUMENTS"
+
+exit
