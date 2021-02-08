@@ -12,10 +12,10 @@
 #                    Variable&Function                     #
 #----------------------------------------------------------#
 
-source $HESTIA/func/main.sh
+source "${HESTIA}/func/main.sh"
 
 keygen() {
-    < /dev/urandom tr -dc _A-Z-a-z-0-9 | head -c${1:-32};echo;
+    < /dev/urandom tr -dc _A-Z-a-z-0-9 | head -c32;echo;
 }
 KEYS="$HESTIA/data/keys/"
 HASH=$(keygen)
@@ -26,18 +26,19 @@ check_hestia_demo_mode
 #                       Action                             #
 #----------------------------------------------------------#
 
-if [ ! -d ${KEYS} ]; then
-  mkdir -p ${KEYS}
+if [[ ! -d ${KEYS} ]]; then
+  mkdir -p "${KEYS}"
 fi
+chmod 0770 "${KEYS}"
 
-if [[ -e ${KEYS}${HASH} ]] ; then
+if [[ -e ${KEYS}${HASH} ]]; then
     while [[ -e ${KEYS}${HASH} ]] ; do
-        HASH=$(keygen)
+        HASH="$(keygen)"
     done
 fi
 
-touch ${KEYS}${HASH}
-echo ${HASH}
+touch "${KEYS}${HASH}"
+echo "${HASH}"
 
 #----------------------------------------------------------#
 #                       Hestia                             #
